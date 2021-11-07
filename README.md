@@ -1,4 +1,4 @@
- SmartBlinds for Home Assistant
+ DIY Battery Powered Smart Blinds for Home Assistant
 
  
 # Youtube Video
