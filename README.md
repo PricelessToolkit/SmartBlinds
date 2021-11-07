@@ -1,4 +1,5 @@
- DIY Battery Powered Smart Blinds for Home Assistant
+ DIY Battery Powered Smart Blinds for Home Assistant.
+ After one month of use with lithium-ion battery 2500mA, I will write real results of autonomy.
 
  
 # Youtube Video
