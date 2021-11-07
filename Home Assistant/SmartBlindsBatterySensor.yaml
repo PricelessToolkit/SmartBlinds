@@ -1,0 +1,6 @@
+sensor:
+  - platform: mqtt
+    state_topic: "SmartBlinds/Blind-1/Battery"
+    name: Blind_1_Battery
+    unit_of_measurement: "%"
+    icon: mdi:Battery-80
