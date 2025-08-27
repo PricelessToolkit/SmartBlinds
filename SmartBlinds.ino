@@ -1,160 +1,164 @@
-/* Author PricelessToolkit 
- *  
- * This Sketch uses fast connect Method. No DHCP no WIFI Search! 
- * 
- * All power measurements are taken with "Power Profiler Kit II" https://www.nordicsemi.com/Products/Development-hardware/Power-Profiler-Kit-2
- * 
- * One cycle connecting to wifi -> Publishing battery Percentage -> Subscribing to Topic
- * Comparing topic value with RTC memory value, last 1.5sec and uses "31.6uA Cycle"
- * 
- * 1 hours tests with 10min Cycle "Deep Sleep/Wake UP/Connect/Publish/Subscribe/Deep Sleep" uses 280uAh.
- * Blinds uses 900uA for every movements Open or Close.
- * 
- * How long will last 3000mA li-Ion 18650 battery? in perfect conditions  10714 hours or 446 deys -3.2 hours for every movement
- * I can say that these data are somewhat theoretical. So don't expect a miracle.
- * Autonomy depends on how many times you open and close the Blinds, WIFI signal strength!, Battery discharge rate, Temperature, Humidity, position of the moon and mars etc.
- * 
- * If you find this project useful or at least interesting, support me with SUBSCRIBING to my channel https://www.youtube.com/c/PricelessToolkit
- */
+/* Smart Blind with 15s WiFi/MQTT timeouts + auto-sleep if no command arrives */
 
 #include <ESP8266WiFi.h>
 #include <WiFiClient.h>
 #include <PubSubClient.h>
 #include <Servo.h>
 
-#define STASSID "Change_This"  // ** your SSID
-#define STAPSK  "Change_This"  // ** your password
+#define STASSID "Change_This"
+#define STAPSK  "Change_This"
 
-
-uint8_t home_mac[6] = { 0xB2, 0xFF, 0xC8, 0xE2, 0xC2, 0xAA };    // ** The MAC address of your wifi router
-int channel = 6;                                                 // ** The wifi channel of your wifi router
+uint8_t home_mac[6] = { 0xB2, 0xFF, 0xC8, 0xE2, 0xC2, 0xAA };
+int channel = 6;
 
 const char* ssid     = STASSID;
 const char* password = STAPSK;
 
 const char* mqtt_username = "Change_This";
 const char* mqtt_password = "Change_This";
-const char* mqtt_server = "Change_This";
-const int mqtt_port = 1883;
+const char* mqtt_server   = "Change_This";
+const int   mqtt_port     = 1883;
+
+const char* TOPIC_BATTERY = "SmartBlinds/Blind-1/Battery";
+const char* TOPIC_ANGLE   = "SmartBlinds/Blind-1/Angle";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// change to suit your local network.  We don't use DHCP to save power!!!!!!
-IPAddress local_IP(192, 168, 2, 200); // ** IP Adress of Blinds
-IPAddress gateway(192, 168, 2, 1);    // ** Network gateway
-IPAddress subnet(255, 255, 255, 0);   // ** Network subnet
+// Static IP
+IPAddress local_IP(192, 168, 2, 200);
+IPAddress gateway (192, 168, 2, 1);
+IPAddress subnet  (255, 255, 255, 0);
 
-uint32_t counter = 0;
-uint32_t mqttcounter = 0;
-int TimeToSleepSec = 600e6; // Cycle Time in milliseconds!  (600e6 = 600sec) 10min
-
+static const uint64_t TimeToSleepUs = 600ULL * 1000000ULL; // 600s = 10 min
+const unsigned long WIFI_TIMEOUT_MS = 15000UL;
+const unsigned long MQTT_TIMEOUT_MS = 15000UL;
+const unsigned long MQTT_WAIT_CMD_MS = 5000UL; // wait max 5s for command after connect
 
 Servo servo;
-int ServoEnablePin = 4; // 5V DC-DC StepUp Pin.
+const int ServoPin       = 5;
+const int ServoEnablePin = 4;
 
+// RTC memory for last angle
+struct RtcState {
+  uint32_t magic;
+  uint32_t angle;
+  uint32_t checksum;
+};
+static const uint32_t RTC_MAGIC = 0xB1A9D501;
+static const uint32_t RTC_SLOT  = 65;
 
+static uint32_t rtcChecksum(const RtcState& s) {
+  return (s.magic ^ s.angle) ^ 0xA5A5A5A5;
+}
+
+// globals for post-connect sleep
+bool commandReceived = false;
+unsigned long connectTime = 0;
+
+void goToSleep() {
+  digitalWrite(ServoEnablePin, LOW);
+  servo.detach();
+
+  if (client.connected()) client.disconnect();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(10);
+
+  ESP.deepSleep(TimeToSleepUs, WAKE_RF_DEFAULT);
+}
 
 void setup() {
   Serial.begin(115200);
-  servo.attach(5);  // attaches the servo
+
   pinMode(ServoEnablePin, OUTPUT);
   digitalWrite(ServoEnablePin, LOW);
+  servo.attach(ServoPin);
 
-  // We start by connecting to a WiFi network
-  
+  WiFi.persistent(false);
+
   WiFi.config(local_IP, gateway, subnet);
-
-  if (!WiFi.config(local_IP, gateway, subnet)) {
-   Serial.println("STA Failed to configure");
-  }
-
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password, channel, home_mac, true);
 
-
+  // WiFi connect with timeout
+  unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    if (++counter > 1000){
-      ESP.restart();
-      
-    }
+    if (millis() - wifiStart >= WIFI_TIMEOUT_MS) goToSleep();
     delay(10);
-    // Serial.print(".");
+    yield();
   }
 
-
   client.setServer(mqtt_server, mqtt_port);
+  client.setKeepAlive(10);
+  client.setSocketTimeout(5);
+  client.setBufferSize(128);
+  client.setCallback(Callback);
+
   reconnect();
-  client.setCallback(Callback); 
-
-
-  
+  connectTime = millis(); // start "wait for command" timer
 }
 
-
 void reconnect() {
+  unsigned long mqttStart = millis();
   while (!client.connected()) {
+    if (millis() - mqttStart >= MQTT_TIMEOUT_MS) goToSleep();
+
     String clientId = "SmartBlind-";
     clientId += String(random(0xffff), HEX);
 
-    // Attempt to connect
     if (client.connect(clientId.c_str(), mqtt_username, mqtt_password)) {
-      int batt = map(analogRead(A0), 554, 750, 0, 100); // (analogRead(A2), MIN, MAX, 0, 100);
-      
-      //Serial.println("MQTT Connected");
-      // Once connected, publish battery 0-100%...
-      client.publish("SmartBlinds/Blind-1/Battery", String(batt).c_str());
+      int raw = analogRead(A0);
+      raw = constrain(raw, 554, 750);
+      int battPct = map(raw, 554, 750, 0, 100);
+      battPct = constrain(battPct, 0, 100);
+      client.publish(TOPIC_BATTERY, String(battPct).c_str(), true);
       client.endPublish();
-      // ... and resubscribe
-      client.subscribe("SmartBlinds/Blind-1/Angle");
 
-    }
-    else
-    {
-      // Wait 0.1 seconds before retrying
-     delay(100);
-	 
-     
+      client.subscribe(TOPIC_ANGLE);
+    } else {
+      delay(100);
+      yield();
     }
   }
 }
-
 
 void Callback(char* topic, byte* payload, unsigned int length) {
-  String Command = "";
+  commandReceived = true; // mark that we got a command
 
-  for (int i = 0; i < length; i++) {
-    Command = Command + (char)payload[i];
-  }  
-  
-  uint32_t AngleValue = Command.toInt();
+  String cmd;
+  cmd.reserve(length);
+  for (unsigned int i = 0; i < length; i++) cmd += (char)payload[i];
+  uint32_t angle = (uint32_t)constrain(cmd.toInt(), 0, 180);
 
-  uint32_t AngleValueOld;
+  // Load last angle from RTC
+  RtcState st{};
+  ESP.rtcUserMemoryRead(RTC_SLOT, (uint32_t*)&st, sizeof(st));
+  bool rtcValid = (st.magic == RTC_MAGIC) && (st.checksum == rtcChecksum(st));
+  uint32_t oldAngle = rtcValid ? st.angle : 255;
 
-  ESP.rtcUserMemoryRead(65, &AngleValueOld, sizeof(AngleValueOld));
-
-
-  if(AngleValueOld != AngleValue) // after wake up checks if the new servo angle is a different then old angle value in RTC Memory 
-  {
-
-    digitalWrite(ServoEnablePin, HIGH); //Enables 5v DC-DC Step UP output for servo
-    delay(100); // Delay for charging Capacitor
-    servo.write(AngleValue); // Changes the angle of the servo
-    ESP.rtcUserMemoryWrite(65, &AngleValue, sizeof(AngleValue)); // writes a new position in RTC Memory
+  if (oldAngle != angle) {
+    digitalWrite(ServoEnablePin, HIGH);
+    delay(120);
+    servo.write(angle);
     delay(250);
-    
-  }
-  
-  ESP.deepSleep(TimeToSleepSec);
+    digitalWrite(ServoEnablePin, LOW);
 
+    st.magic = RTC_MAGIC;
+    st.angle = angle;
+    st.checksum = rtcChecksum(st);
+    ESP.rtcUserMemoryWrite(RTC_SLOT, (uint32_t*)&st, sizeof(st));
+  }
+
+  goToSleep();
 }
 
-
 void loop() {
-
-    if (!client.connected()) 
-        {
-            reconnect();
-        }
+  if (!client.connected()) reconnect();
   client.loop();
+
+  // if no command received within MQTT_WAIT_CMD_MS after connect, go to sleep
+  if (!commandReceived && (millis() - connectTime > MQTT_WAIT_CMD_MS)) {
+    goToSleep();
+  }
 }
